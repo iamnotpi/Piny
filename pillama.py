@@ -1,23 +1,42 @@
 import math
+import time
 import torch 
 import torch.nn as nn
 from torch.nn import functional as F
 from dataclasses import dataclass
+from tokenizer import Tokenizer
 
-# tiny Shakespeare dataset
-with open("D:\\Code\\Python\\input.txt", 'r', encoding='utf-8') as file:
-    text = file.read()
+
+class DataLoaderLite:
+    def __init__(self, input, batch_size, sequence_length, tokenizer):
+        self.B = batch_size
+        self.T = sequence_length
+        with open(input, 'r', encoding='utf-8') as f:
+            text = f.read()
+        self.tokens = torch.tensor(tokenizer.encode(text, bos=False, eos=False))
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + B * T + 1]
+        X, Y = buf[:-1].view(B, T), buf[1:].view(B, T)
+        self.current_position += B * T 
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_position = 0 
+        return X, Y
+
 
 @dataclass
 class PiLlamaConfig:
-    n_embd: int = 768
-    block_size: int = 2048
-    n_heads: int = 12
+    n_embd: int = 512
+    block_size: int = 128 # todo: replace with 1024
+    n_heads: int = 16
     kv_heads: int = 4
-    n_layers: int = 4
-    vocab_size: int = 50257
+    n_layers: int = 16
+    vocab_size: int = 16384
     flash_attention: bool = True
     rope_base: int = 10000
+    max_lr: int = 6e-4
 
 
 class RMSNorm(nn.Module):
@@ -58,7 +77,7 @@ class GroupedQueryAttention(nn.Module):
 
         # Rotary positional embedding
         inv_freqs = 1.0 / self.config.rope_base ** (torch.arange(0, self.head_size, 2, device=x.device).float() / self.head_size)
-        theta = torch.outer(torch.arange(1, T + 1), inv_freqs)
+        theta = torch.outer(torch.arange(1, T + 1, device=x.device), inv_freqs)
         pos = torch.repeat_interleave(theta, 2, dim=-1) 
 
         rotated_q = self._rotate_half(q)
@@ -103,6 +122,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.rmsn_mlp(x))
         return x
 
+
 class PiLlama(nn.Module):
     def __init__(self, config: PiLlamaConfig):
         super().__init__()
@@ -126,7 +146,93 @@ class PiLlama(nn.Module):
         if targets is not None: 
             loss = F.cross_entropy(logits.view(B * T, -1), targets.view(-1))
         return logits, loss
+    
+    def configure_optimizer(self, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True, device_type='cuda'):
+        params_dict = {np: p for np, p in self.named_parameters()}
+        params_dict = {np: p for np, p in params_dict.items() if p.requires_grad}
+        decay_params = [p for np, p in params_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for np, p in params_dict.items() if p.dim() < 2]
+        param_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        print("Number of weights with decay:", sum(p.numel() for p in decay_params))
+        print("Number of weights without decay:", sum(p.numel() for p in nodecay_params))
+        use_fused = fused and device_type == "cuda"
+        optimizer = torch.optim.AdamW(params=param_groups, lr=lr, betas=betas, fused=use_fused)
+        return optimizer
+    
+class CosineLRScheduler:
+    def __init__(self, max_lr, min_lr, warmup_step, max_step):
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.warmup_step = warmup_step
+        self.max_step = max_step
 
-model = PiLlama(PiLlamaConfig())
+    def get_lr(self, it):
+        if it < self.warmup_step:
+            return self.max_lr * (it + 1) / self.warmup_step
+        elif it > self.max_step:
+            return self.min_lr
+        lr_decay_ratio = (it - self.warmup_step) / (self.max_step - self.warmup_step)
+        return self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + math.cos(math.pi * lr_decay_ratio))
+
+device = "cpu" 
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = "mps"
+print("Device:", device)
+
+model_config = PiLlamaConfig()
+model = PiLlama(model_config)
+model = model.to(device)
 num_params = sum(p.numel() for p in model.parameters())
 print(f"Number of parameters: {num_params}")
+
+
+max_step = 50
+optimizer = model.configure_optimizer(device_type=device)
+scheduler = CosineLRScheduler(
+    max_lr = model_config.max_lr, 
+    min_lr = 0.1 * model_config.max_lr, 
+    warmup_step = 10, 
+    max_step = max_step
+)
+
+# # tiny Shakespeare dataset
+input = "D:\\Code\\Python\\input.txt"
+
+tokenizer = Tokenizer('pi_tokenizer.model')
+train_loader = DataLoaderLite(input, batch_size=4, sequence_length=model_config.block_size, tokenizer=tokenizer)
+
+# Using TF32 (if available) for faster matrix multiplication 
+torch.set_float32_matmul_precision('high')
+
+device_type = 'cuda' if device.startswith('cuda') else 'cpu'
+# Mixed precision training with cuda
+use_amp = device_type == 'cuda'
+if use_amp:
+    type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+else:
+    type = torch.float32
+scaler = torch.amp.GradScaler('cuda', enabled=(type == torch.float16))
+    
+model.train()
+for step in range(max_step):
+    t0 = time.time()
+    Xb, Yb = train_loader.next_batch()
+    Xb, Yb = Xb.to(device), Yb.to(device)
+    with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
+        logits, loss = model(Xb, Yb)
+    lr = scheduler.get_lr(step) 
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.zero_grad()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    t1 = time.time()
+    dt = t1 - t0
+    tok_per_sec = train_loader.B * train_loader.T / dt
+    print(f'Step: {step} | Learning rate: {lr:.4e} | Loss: {loss.item():.6f} | Time: {dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
