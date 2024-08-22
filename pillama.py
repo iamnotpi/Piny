@@ -30,7 +30,7 @@ class DataLoaderLite:
 class PiLlamaConfig:
     n_embd: int = 768
     ffn_dim: int = int(8/3 * n_embd)
-    block_size: int = 1024
+    block_size: int = 2048
     n_heads: int = 16
     kv_heads: int = 4
     n_layers: int = 8
@@ -193,7 +193,22 @@ model = model.to(device)
 num_params = sum(p.numel() for p in model.parameters())
 print(f"Number of parameters: {num_params}")
 
+# Using TF32 (if available) for faster matrix multiplication 
+torch.set_float32_matmul_precision('high')
 
+device_type = 'cuda' if device.startswith('cuda') else 'cpu'
+# Mixed precision training with cuda
+use_amp = device_type == 'cuda'
+if use_amp:
+    type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+else:
+    type = torch.float32
+scaler = torch.amp.GradScaler('cuda', enabled=(type == torch.float16))
+
+
+total_batch_size = 524588
+B, T = 4, 2048
+grad_accum_steps = total_batch_size // (B * T)
 max_step = 50
 optimizer = model.configure_optimizer(device_type=device)
 scheduler = CosineLRScheduler(
@@ -208,34 +223,29 @@ input = "D:\\Code\\Python\\input.txt"
 
 tokenizer = Tokenizer('pi_tokenizer.model')
 train_loader = DataLoaderLite(input, batch_size=4, sequence_length=model_config.block_size, tokenizer=tokenizer)
-
-# Using TF32 (if available) for faster matrix multiplication 
-torch.set_float32_matmul_precision('high')
-
-device_type = 'cuda' if device.startswith('cuda') else 'cpu'
-# Mixed precision training with cuda
-use_amp = device_type == 'cuda'
-if use_amp:
-    type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-else:
-    type = torch.float32
-scaler = torch.amp.GradScaler('cuda', enabled=(type == torch.float16))
     
 model.train()
 for step in range(max_step):
     t0 = time.time()
-    Xb, Yb = train_loader.next_batch()
-    Xb, Yb = Xb.to(device), Yb.to(device)
-    with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
-        logits, loss = model(Xb, Yb)
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        Xb, Yb = train_loader.next_batch()
+        Xb, Yb = Xb.to(device), Yb.to(device)
+        with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
+            logits, loss = model(Xb, Yb)
+        loss /= grad_accum_steps # Gradients accumulation
+        loss_accum += loss.detach() # No need to compute gradients 
+        scaler.scale(loss).backward()
     lr = scheduler.get_lr(step) 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    optimizer.zero_grad()
-    scaler.scale(loss).backward()
+    # Gradient clipping
+    scaler.unscale_(optimizer)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     scaler.step(optimizer)
     scaler.update()
+    optimizer.zero_grad()
     t1 = time.time()
     dt = t1 - t0
-    tok_per_sec = train_loader.B * train_loader.T / dt
-    print(f'Step: {step} | Learning rate: {lr:.4e} | Loss: {loss.item():.6f} | Time: {dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
+    tok_per_sec = train_loader.B * train_loader.T * grad_accum_steps / dt
+    print(f'Step: {step} | LR: {lr:.4e} | Norm: {norm:.4f} | Loss: {loss_accum.item():.6f} | Time: {dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
