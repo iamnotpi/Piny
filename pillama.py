@@ -28,11 +28,12 @@ class DataLoaderLite:
 
 @dataclass
 class PiLlamaConfig:
-    n_embd: int = 512
-    block_size: int = 128 # todo: replace with 1024
+    n_embd: int = 768
+    ffn_dim: int = int(8/3 * n_embd)
+    block_size: int = 1024
     n_heads: int = 16
     kv_heads: int = 4
-    n_layers: int = 16
+    n_layers: int = 8
     vocab_size: int = 16384
     flash_attention: bool = True
     rope_base: int = 10000
@@ -99,14 +100,13 @@ class GroupedQueryAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: PiLlamaConfig):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.w1 = nn.Linear(config.n_embd, config.ffn_dim, bias=False)
+        self.w2 = nn.Linear(config.n_embd, config.ffn_dim, bias=False)
+        self.w3 = nn.Linear(config.ffn_dim, config.n_embd, bias=False)
+        self.silu = nn.SiLU()
 
     def forward(self, x):
-        x = self.c_fc(x) 
-        x = self.gelu(x)
-        return self.c_proj(x)
+        return self.w3(self.silu(self.w2(x)) * self.w1(x))
 
 
 class Block(nn.Module):
@@ -131,7 +131,7 @@ class PiLlama(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
             rmsn = RMSNorm(config.n_embd)
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Weights sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
 
@@ -145,7 +145,7 @@ class PiLlama(nn.Module):
         loss = None
         if targets is not None: 
             loss = F.cross_entropy(logits.view(B * T, -1), targets.view(-1))
-        return logits, loss
+        return logits, loss if loss is not None else logits
     
     def configure_optimizer(self, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True, device_type='cuda'):
         params_dict = {np: p for np, p in self.named_parameters()}
@@ -162,6 +162,7 @@ class PiLlama(nn.Module):
         optimizer = torch.optim.AdamW(params=param_groups, lr=lr, betas=betas, fused=use_fused)
         return optimizer
     
+
 class CosineLRScheduler:
     def __init__(self, max_lr, min_lr, warmup_step, max_step):
         self.max_lr = max_lr
@@ -177,12 +178,14 @@ class CosineLRScheduler:
         lr_decay_ratio = (it - self.warmup_step) / (self.max_step - self.warmup_step)
         return self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + math.cos(math.pi * lr_decay_ratio))
 
+
 device = "cpu" 
 if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = "mps"
 print("Device:", device)
+
 
 model_config = PiLlamaConfig()
 model = PiLlama(model_config)
