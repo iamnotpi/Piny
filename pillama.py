@@ -1,28 +1,34 @@
 import math
+import os
 import time
 import torch 
 import torch.nn as nn
 from torch.nn import functional as F
 from dataclasses import dataclass
 from tokenizer import Tokenizer
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 
 class DataLoaderLite:
-    def __init__(self, input, batch_size, sequence_length, tokenizer):
+    def __init__(self, input, batch_size, sequence_length, tokenizer, process_rank, num_processes):
         self.B = batch_size
         self.T = sequence_length
+        self.process_rank = process_rank
+        self.num_processes = num_processes
         with open(input, 'r', encoding='utf-8') as f:
             text = f.read()
         self.tokens = torch.tensor(tokenizer.encode(text, bos=False, eos=False))
-        self.current_position = 0
+        self.current_position = self.process_rank * self.B * self.T
 
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position:self.current_position + B * T + 1]
         X, Y = buf[:-1].view(B, T), buf[1:].view(B, T)
-        self.current_position += B * T 
-        if self.current_position + B * T + 1 > len(self.tokens):
-            self.current_position = 0 
+        self.current_position += B * T * self.num_processes
+        if self.current_position + B * T * self.process_rank + 1 > len(self.tokens):
+            self.current_position = self.process_rank * B * T 
         return X, Y
 
 
@@ -156,8 +162,9 @@ class PiLlama(nn.Module):
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
-        print("Number of weights with decay:", sum(p.numel() for p in decay_params))
-        print("Number of weights without decay:", sum(p.numel() for p in nodecay_params))
+        if master_process:
+            print("Number of weights with decay:", sum(p.numel() for p in decay_params))
+            print("Number of weights without decay:", sum(p.numel() for p in nodecay_params))
         use_fused = fused and device_type == "cuda"
         optimizer = torch.optim.AdamW(params=param_groups, lr=lr, betas=betas, fused=use_fused)
         return optimizer
@@ -179,24 +186,35 @@ class CosineLRScheduler:
         return self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + math.cos(math.pi * lr_decay_ratio))
 
 
-device = "cpu" 
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = "mps"
-print("Device:", device)
+# https://pytorch.org/docs/stable/elastic/run.html
+# torchrun --standalone --nproc_per_node=2 pillama.py
+ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run?
+if ddp: 
+    assert torch.cuda.is_available(), "CUDA required!"
+    init_process_group('nccl') # Backend to use (nccl for distributed GPUs training)
+    ddp_rank = int(os.environ['RANK']) # Rank of the current processor (on all nodes) (1 node <-> 1 device)
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) # Rank of the current processor on the current node 
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # Number of GPUs
+    device = f'cuda:{ddp_local_rank}' # 1 machine -> local_rank == rank
+    torch.cuda.set_device(device)
+    master_process = (ddp_rank == 0)
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cpu" 
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = "mps"
+    print("Device:", device)
 
-
-model_config = PiLlamaConfig()
-model = PiLlama(model_config)
-model = model.to(device)
-num_params = sum(p.numel() for p in model.parameters())
-print(f"Number of parameters: {num_params}")
+device_type = 'cuda' if device.startswith('cuda') else 'cpu'
 
 # Using TF32 (if available) for faster matrix multiplication 
 torch.set_float32_matmul_precision('high')
 
-device_type = 'cuda' if device.startswith('cuda') else 'cpu'
 # Mixed precision training with cuda
 use_amp = device_type == 'cuda'
 if use_amp:
@@ -205,12 +223,22 @@ else:
     type = torch.float32
 scaler = torch.amp.GradScaler('cuda', enabled=(type == torch.float16))
 
+model_config = PiLlamaConfig()
+model = PiLlama(model_config)
+model.to(device)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
+num_params = sum(p.numel() for p in model.parameters())
+if master_process:
+    print(f"Number of parameters: {num_params}")
 
 total_batch_size = 524588
 B, T = 4, 2048
-grad_accum_steps = total_batch_size // (B * T)
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 max_step = 50
-optimizer = model.configure_optimizer(device_type=device)
+
+optimizer = raw_model.configure_optimizer(device_type=device)
 scheduler = CosineLRScheduler(
     max_lr = model_config.max_lr, 
     min_lr = 0.1 * model_config.max_lr, 
@@ -218,11 +246,18 @@ scheduler = CosineLRScheduler(
     max_step = max_step
 )
 
-# # tiny Shakespeare dataset
+# tiny Shakespeare dataset
 input = "D:\\Code\\Python\\input.txt"
 
 tokenizer = Tokenizer('pi_tokenizer.model')
-train_loader = DataLoaderLite(input, batch_size=4, sequence_length=model_config.block_size, tokenizer=tokenizer)
+train_loader = DataLoaderLite(
+    input, 
+    batch_size = 4, 
+    sequence_length = model_config.block_size, 
+    tokenizer = tokenizer, 
+    process_rank = ddp_rank, 
+    num_processes = ddp_world_size
+)
     
 model.train()
 for step in range(max_step):
@@ -231,11 +266,17 @@ for step in range(max_step):
     for micro_step in range(grad_accum_steps):
         Xb, Yb = train_loader.next_batch()
         Xb, Yb = Xb.to(device), Yb.to(device)
+        # Only sync gradients at the end of a step
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
             logits, loss = model(Xb, Yb)
         loss /= grad_accum_steps # Gradients accumulation
         loss_accum += loss.detach() # No need to compute gradients 
         scaler.scale(loss).backward()
+    if ddp:
+        # Sync the loss between different processes across all machine and all of them receive the same final result
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     lr = scheduler.get_lr(step) 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -247,5 +288,8 @@ for step in range(max_step):
     optimizer.zero_grad()
     t1 = time.time()
     dt = t1 - t0
-    tok_per_sec = train_loader.B * train_loader.T * grad_accum_steps / dt
-    print(f'Step: {step} | LR: {lr:.4e} | Norm: {norm:.4f} | Loss: {loss_accum.item():.6f} | Time: {dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
+    tok_per_sec = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size / dt
+    if master_process:
+        print(f'Step: {step} | LR: {lr:.4e} | Norm: {norm:.4f} | Loss: {loss_accum.item():.6f} | Time: {dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
+if ddp:
+    destroy_process_group()
