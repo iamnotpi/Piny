@@ -30,6 +30,7 @@ class DataLoaderLite:
         data_dir = 'TinyStories'
         self.shards = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if split in f]
         self.num_shards = len(self.shards)
+        self.current_shard = 0
         self.advance()
 
     def advance(self, reset=False):
@@ -43,7 +44,7 @@ class DataLoaderLite:
         buf = self.tokens[self.current_position:self.current_position + B * T + 1]
         X, Y = buf[:-1].view(B, T), buf[1:].view(B, T)
         self.current_position += B * T * self.num_processes
-        if self.current_position + B * T * self.process_rank + 1 > len(self.tokens):
+        if self.current_position + B * T * self.num_processes + 1 > len(self.tokens):
             self.advance() 
         return X, Y
 
@@ -52,17 +53,17 @@ class DataLoaderLite:
 class PiLlamaConfig:
     n_embd: int = 768
     ffn_dim: int = int(8/3 * n_embd)
-    block_size: int = 1024
+    block_size: int = 2048
     n_heads: int = 16
     kv_heads: int = 4
     n_layers: int = 4
     vocab_size: int = 16384
     flash_attention: bool = True
     rope_base: int = 10000
-    max_lr: int = 6e-4
-    max_batch_size: int = 65536
+    max_lr: int = 9e-4
+    max_batch_size: int = 262144
 
-B, T = 4, 1024
+B, T = 32, 2048
 
 class RMSNorm(nn.Module):
     def __init__(self, n_embd, eps=1e-6):
@@ -76,6 +77,24 @@ class RMSNorm(nn.Module):
         return x * inv_norm * self.gain 
         
 
+class KVCache(nn.Module):
+    def __init__(self, batch_size, max_seq_length, n_kv_heads, head_size, device):
+        super().__init__()
+        self.register_buffer("cache_k", torch.zeros((batch_size, max_seq_length, n_kv_heads, head_size), device=device))
+        self.register_buffer("cache_v", torch.zeros((batch_size, max_seq_length, n_kv_heads, head_size), device=device))
+
+    def update(self, start_pos, k, v):
+        # k shape: (B, T, n_kv_heads, head_size)
+        seq_length = k.size(1)
+        # Add the new keys and values to the cache
+        self.cache_k[:, start_pos:start_pos + seq_length] = k
+        self.cache_v[:, start_pos:start_pos + seq_length] = v
+        # Return the updated cache (all keys and values from the beginning up to the current position) 
+        k = self.cache_k[:, :start_pos + seq_length]    
+        v = self.cache_v[:, :start_pos + seq_length]
+        return k, v
+
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self, config: PiLlamaConfig):
         super().__init__()
@@ -87,16 +106,25 @@ class GroupedQueryAttention(nn.Module):
         self.value = nn.Linear(config.n_embd, config.kv_heads * self.head_size, bias=False)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.register_buffer("mask", torch.tril(torch.ones((config.block_size, config.block_size))).view(1, 1, config.block_size, config.block_size))
+        # self.cache = None
 
     def _rotate_half(self, x):
         return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).view(x.shape)
     
-    def forward(self, x):
+    def forward(self, x, mask=None):
         B, T, C = x.shape
+        # q = self.query(x).view(B, T, self.config.n_heads, self.head_size) # (B, T, nh, head_size)
+        # k = self.key(x).view(B, T, self.config.kv_heads, self.head_size) # (B, T, nkvh, head_size)
+        # v = self.value(x).view(B, T, self.config.kv_heads, self.head_size) # (B, T, nkvh, head_size)
         q = self.query(x).view(B, T, self.config.n_heads, self.head_size).transpose(1, 2) # (B, nh, T, head_size)
         k = self.key(x).view(B, T, self.config.kv_heads, self.head_size).transpose(1, 2) # (B, nkvh, T, head_size)
         v = self.value(x).view(B, T, self.config.kv_heads, self.head_size).transpose(1, 2) # (B, nkvh, T, head_size)
 
+        # if self.cache is not None:
+        #     k, v = self.cache.update(T, k, v)
+
+        # k = k.repeat_interleave(self.config.n_heads // self.config.kv_heads, dim=2) # (B, cache_len + T, nh, head_size)
+        # v = v.repeat_interleave(self.config.n_heads // self.config.kv_heads, dim=2) # (B, cache_len + T, nh, head_size)
         k = k.repeat_interleave(self.config.n_heads // self.config.kv_heads, dim=1) # (B, nh, T, head_size)
         v = v.repeat_interleave(self.config.n_heads // self.config.kv_heads, dim=1) # (B, nh, T, head_size)
 
@@ -105,6 +133,10 @@ class GroupedQueryAttention(nn.Module):
         theta = torch.outer(torch.arange(1, T + 1, device=x.device), inv_freqs)
         pos = torch.repeat_interleave(theta, 2, dim=-1) 
 
+        # q = q.transpose(1, 2) # (B, nh, T, head_size)
+        # k = k.transpose(1, 2) # (B, nh, cache_len + T, head_size)
+        # v = v.transpose(1, 2) # (B, nh, cache_len + T, head_size)
+
         rotated_q = self._rotate_half(q)
         rotated_k = self._rotate_half(k)
         q = q * torch.cos(pos) + rotated_q * torch.sin(pos)
@@ -112,11 +144,13 @@ class GroupedQueryAttention(nn.Module):
 
         if self.config.flash_attention:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         else:
-            attn = (q @ k.transpose(-1, -2)) * (1.0 / math.sqrt(self.head_size))
+            attn = (q @ k.transpose(-1, -2)) * (1.0 / math.sqrt(self.head_size)) # (B, nh, T, cache_len + T)
+            # attn = attn + mask
             attn = attn.masked_fill(self.mask[:,:,:T,:T]==0, float('-inf'))
             attn = F.softmax(attn, dim=-1)
-            y = attn @ v
+            y = attn @ v # (B, nh, T, head_size)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
@@ -173,7 +207,27 @@ class PiLlama(nn.Module):
             loss = F.cross_entropy(logits.view(B * T, -1), targets.view(-1))
         return logits, loss if loss is not None else logits
     
-    def configure_optimizer(self, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True, device_type='cuda'):
+    def forward_loss(self, idx, targets):
+        B, T = idx.size()
+        x = self.transformer.wte(idx)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.rmsn(x)
+        logits = self.lm_head(x) # (B, T, n_embd)
+        loss = F.cross_entropy(logits.view(B * T, -1), targets.view(-1))
+        return logits, loss 
+    
+    @torch.inference_mode()
+    def forward_inference(self, idx):
+        B, T = idx.size()
+        x = self.transformer.wte(idx)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.rmsn(x)
+        logits = self.lm_head(x)
+        return logits
+    
+    def configure_optimizer(self, lr=9e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True, device_type='cuda'):
         params_dict = {np: p for np, p in self.named_parameters()}
         params_dict = {np: p for np, p in params_dict.items() if p.requires_grad}
         decay_params = [p for np, p in params_dict.items() if p.dim() >= 2]
@@ -190,30 +244,39 @@ class PiLlama(nn.Module):
         return optimizer
     
     @torch.no_grad()
-    def generate(self, tokens, max_gen_len, top_k, temperature, seed):
+    def generate(self, tokens, max_gen_len, top_p, temperature, generator):
         # tokens: A list of token ids
+        # max_gen_len: Maximum length of the generated text
         self.eval()
         output = []
+        # min_prompt_len = min(len(t) for t in tokens)
+        # max_prompt_len = max(len(t) for t in tokens)
+        # assert max_prompt_len <= self.config.block_size
+        # total_len = min(max_gen_len + max_gen_len, self.config.block_size)
+        # batch_size = len(tokens)
+        # for block in self.transformer.h:
+        #     block.attn.cache = KVCache(
+        #         batch_size = batch_size,
+        #         max_seq_length = total_len,
+        #         n_kv_heads = self.config.kv_heads,
+        #         head_size = self.config.n_embd // self.config.n_heads,
+        #         device = block.attn.weight.device
+        #     )
         for ids in tokens: 
             x = torch.tensor(ids, dtype=torch.long).unsqueeze(0)
             while x.size(1) < max_gen_len or x[:, -1] != self.tokenizer.eos_id:
-                with torch.no_grad():
-                    logits, _ = self(x)
-                    logits = logits[:, -1, :]
-                    if temperature > 0:
-                        logits /= temperature
-                    probs = F.softmax(logits, dim=-1)
-                    top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
-                    torch.manual_seed(seed)
-                    next_token = torch.multinomial(top_k_probs, num_samples=1)
-                    xcol = torch.gather(top_k_indices, -1, next_token) # Similar to indexing top_k_indices with next_token
-                    x = torch.cat((x, xcol), dim=1)
+                logits, _ = self(x)
+                logits = logits[:, -1, :]
+                if temperature > 0:
+                    logits = logits / temperature
+                xcol = sample_top_p(logits, top_p, generator) # Similar to indexing top_k_indices with next_token
+                x = torch.cat((x, xcol), dim=1)
             output.append(x.tolist())
         return output
     
-    def text_generation(self, texts, max_gen_len, top_k, temperature, seed):
+    def text_generation(self, texts, max_gen_len, top_p, temperature=1.0, generator=None):
         tokens = [self.tokenizer.encode(text, bos=True, eos=False) for text in texts]
-        generated = self.generate(tokens, max_gen_len, top_k, temperature, seed)
+        generated = self.generate(tokens, max_gen_len, top_p, temperature, generator)
         decoded = []
         for ids in generated:
             decoded.append(self.tokenizer.decode(ids))
@@ -228,6 +291,19 @@ class PiLlama(nn.Module):
         model.load_state_dict(checkpoint['model'])
         return model
         
+def sample_top_p(logits, top_p, generator):
+    # logits shape: (B, T, vocab_size)
+    probs = F.softmax(logits, dim=-1)
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    cum_probs = torch.cumsum(sorted_probs, dim=-1)
+    # Shift cum_probs by one position to the right
+    mask = cum_probs - sorted_probs > top_p 
+    sorted_probs.masked_fill_(mask, 0.0)
+    sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
+    sampled_indices = torch.multinomial(sorted_probs, num_samples=1, generator=generator) # Indices from sorted_probs
+    # Match the indices with the original indices from sorted_indices
+    sampled_indices = torch.gather(sorted_indices, -1, sampled_indices) 
+    return sampled_indices
 
 class CosineLRScheduler:
     def __init__(self, max_lr, min_lr, warmup_step, max_step):
@@ -279,7 +355,7 @@ if use_amp:
     type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 else:
     type = torch.float32
-scaler = torch.amp.GradScaler('cuda', enabled=(type == torch.float16))
+scaler = torch.cuda.amp.GradScaler(enabled=(type == torch.float16))
 
 model_config = PiLlamaConfig()
 tokenizer = Tokenizer('pi_tokenizer.model')
@@ -292,15 +368,17 @@ num_params = sum(p.numel() for p in model.parameters())
 if master_process:
     print(f"Number of parameters: {num_params}")
 
-total_batch_size = 65536
+total_batch_size = 262144
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-max_step = 6164
+val_size = 4541735 # Magic number
+val_accum_steps = val_size // (B * T * ddp_world_size)
+max_step = 6164 # Approx. 4 epochs
 
 optimizer = raw_model.configure_optimizer(device_type=device)
 scheduler = CosineLRScheduler(
     max_lr = model_config.max_lr, 
     min_lr = 0.1 * model_config.max_lr, 
-    warmup_step = 10, 
+    warmup_step = 50, 
     max_step = max_step
 )
 
@@ -322,20 +400,36 @@ val_loader = DataLoaderLite(
 log_dir = 'logs'
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, 'log.txt')
+log_val_file = os.path.join(log_dir, 'log_val.txt')
     
-for step in range(0):
+for step in range(max_step):
     t0 = time.time()
     loss_accum = 0.0
-    # Save checkpoint every 250 steps
-    if (step % 250 == 0 or step == max_step - 1) and master_process:
-        checkpoint_path = os.path.join(log_dir, f'pillama_{step}.pt')
-        checkpoint = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'step': step
-        }
-        torch.save(checkpoint, checkpoint_path)
-        
+    # Save checkpoint and eval every 250 steps
+    if (step % 250 == 0 or step == max_step - 1):
+        with torch.no_grad():
+            model.eval()
+            val_loader.advance(reset=True)
+            val_accum = 0.0
+            for _ in range(val_accum_steps):
+                Xb, Yb = val_loader.next_batch()
+                Xb, Yb = Xb.to(device), Yb.to(device)
+                with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
+                    _, loss = model(Xb, Yb)
+                loss /= val_accum_steps
+                val_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            with open(log_val_file, 'a') as f:
+                f.write(f'Step {step}, val loss {val_accum.item():.6f}\n')
+            checkpoint_path = os.path.join(log_dir, f'pillama_{step}.pt')
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'step': step
+            }
+            torch.save(checkpoint, checkpoint_path)
     model.train()
     for micro_step in range(grad_accum_steps):
         Xb, Yb = train_loader.next_batch()
@@ -363,29 +457,19 @@ for step in range(0):
     if device_type == "cuda":
         torch.cuda.synchronize()
     t1 = time.time()
-    with torch.no_grad():
-        model.eval()
-        val_loader.advance(reset=True)
-        val_accum = 0.0
-        val_accum_steps = 20
-        for _ in range(val_accum_steps):
-            Xb, Yb = val_loader.next_batch()
-            Xb, Yb = Xb.to(device), Yb.to(device)
-            with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
-                _, loss = model(Xb, Yb)
-            loss /= val_accum_steps
-            val_accum += loss.detach()
-        if ddp:
-            dist.all_reduce(val_accum, op=dist.ReduceOp.AVG)
     if master_process:
         with open(log_file, 'a') as f:
-            f.write(f'Step {step}, training loss {loss_accum.item():.6f}, val loss {val_accum.item():.6f}, norm {norm:.4f}\n')
+            f.write(f'Step {step}, training loss {loss_accum.item():.6f}, norm {norm:.4f}\n')
         dt = t1 - t0
         tok_per_sec = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size / dt
         print(f'Step: {step} | Loss: {loss_accum.item():.6f} | LR: {lr:.4e} | Time: {1000 * dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
 
-prompts = ["Once upon a time, "]
-generated = model.text_generation(prompts, max_gen_len=128, top_k=50, temperature=1.2, seed=42)
+prompts = [
+    "Lily likes cats and dogs. She asked her mom for a dog and her mom said no, so instead she asked"
+]
+rng = torch.Generator(device=device)
+rng.manual_seed(42)
+generated = model.text_generation(prompts, max_gen_len=128, top_p=0.85, temperature=1., generator=rng)
 for text in generated:
     print(text)
 if ddp:
