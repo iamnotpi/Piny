@@ -50,7 +50,7 @@ class DataLoaderLite:
 
 
 @dataclass
-class PiLlamaConfig:
+class PinyConfig:
     n_embd: int = 768
     ffn_dim: int = int(8/3 * n_embd)
     block_size: int = 2048
@@ -105,7 +105,7 @@ def apply_rope(x, inv_freqs):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, config: PiLlamaConfig):
+    def __init__(self, config: PinyConfig):
         super().__init__()
         self.config = config
         assert config.n_heads > config.kv_heads, "Number of heads must be larger than number of kv heads"
@@ -156,7 +156,7 @@ class GroupedQueryAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: PiLlamaConfig):
+    def __init__(self, config: PinyConfig):
         super().__init__()
         self.w1 = nn.Linear(config.n_embd, config.ffn_dim, bias=False)
         self.w2 = nn.Linear(config.n_embd, config.ffn_dim, bias=False)
@@ -168,7 +168,7 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: PiLlamaConfig):
+    def __init__(self, config: PinyConfig):
         super().__init__()
         self.attn = GroupedQueryAttention(config)
         self.rmsn_attn = RMSNorm(config.n_embd)
@@ -181,8 +181,8 @@ class Block(nn.Module):
         return x
 
 
-class PiLlama(nn.Module):
-    def __init__(self, config: PiLlamaConfig, tokenizer: Tokenizer):
+class Piny(nn.Module):
+    def __init__(self, config: PinyConfig, tokenizer: Tokenizer):
         super().__init__()
         self.config = config
         self.transformer = nn.ModuleDict(dict(
@@ -323,7 +323,7 @@ class PiLlama(nn.Module):
         assert os.path.isfile(checkpoint_path), f"Checkpoint file not found: {checkpoint_path}"
         checkpoint = torch.load(checkpoint_path, map_location=device)
         tokenizer = Tokenizer(tokenizer_path)
-        model = PiLlama(PiLlamaConfig(), tokenizer)
+        model = Piny(PinyConfig(), tokenizer)
         model.load_state_dict(checkpoint['model'])
         return model
         
@@ -358,7 +358,7 @@ class CosineLRScheduler:
 
 def main():
     # https://pytorch.org/docs/stable/elastic/run.html
-    # torchrun --standalone --nproc_per_node=2 pillama.py
+    # torchrun --standalone --nproc_per_node=2 Piny.py
     ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run?
     if ddp: 
         assert torch.cuda.is_available(), "CUDA required!"
@@ -403,9 +403,9 @@ def main():
         type = torch.float32
     scaler = torch.cuda.amp.GradScaler(enabled=(type == torch.float16))
 
-    model_config = PiLlamaConfig()
+    model_config = PinyConfig()
     tokenizer = Tokenizer('pi_tokenizer.model')
-    model = PiLlama(model_config, tokenizer)
+    model = Piny(model_config, tokenizer)
     model.to(device)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -463,7 +463,7 @@ def main():
             if master_process:
                 with open(log_val_file, 'a') as f:
                     f.write(f'Step {step}, val loss {val_accum.item():.6f}\n')
-                checkpoint_path = os.path.join(log_dir, f'pillama_{step}.pt')
+                checkpoint_path = os.path.join(log_dir, f'Piny_{step}.pt')
                 checkpoint = {
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
