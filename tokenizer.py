@@ -15,6 +15,7 @@ class Tokenizer:
         self.vocab_size = self.sp_model.vocab_size()
         self.bos_id = self.sp_model.bos_id()
         self.eos_id = self.sp_model.eos_id()
+        self.pad_id = self.sp_model.pad_id()    
 
     def train(self, input_file, model_prefix='pi_tokenizer', vocab_size=16384):
         SentencePieceTrainer.train(
