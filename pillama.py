@@ -91,23 +91,17 @@ class KVCache(nn.Module):
         k = self.cache_k[:, :, :start_pos + seq_length]    
         v = self.cache_v[:, :, :start_pos + seq_length]
         return k, v
-
-def rotate_half(x):
-    return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).view(x.shape)
     
-def inv_freqs(dim, seq_len, base=10000):
-    inv_freqs = 1.0 / base ** (torch.arange(0, dim, 2).float() / dim)
-    theta = torch.outer(torch.arange(1, seq_len + 1), inv_freqs)
+def compute_inv_freqs(dim, seq_len, base=10000, device=None):
+    inv_freqs = 1.0 / base ** (torch.arange(0, dim, 2, device=device).float() / dim)
+    theta = torch.outer(torch.arange(1, seq_len + 1, device=device), inv_freqs)
     pos = torch.repeat_interleave(theta, 2, dim=-1) 
     return pos
 
-def apply_rope(x, inv_freqs, start_pos):
+def apply_rope(x, inv_freqs):
     # x shape: (B, nh, T, head_size)
-    if start_pos == -1:
-        start_pos = 0
-    pos = inv_freqs[start_pos:start_pos + x.size(2)]
     rotated_x = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).view(x.shape)
-    return x * torch.cos(pos) + rotated_x * torch.sin(pos)
+    return x * torch.cos(inv_freqs) + rotated_x * torch.sin(inv_freqs)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -122,10 +116,9 @@ class GroupedQueryAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         # Mask is deprecated, preseved for compatibility with pretrained models
         self.register_buffer("mask", torch.tril(torch.ones((config.block_size, config.block_size))).view(1, 1, config.block_size, config.block_size))
-        self.inv_freqs = inv_freqs(self.head_size, config.block_size, base=config.rope_base)
         self.cache = None
     
-    def forward(self, x, start_pos, mask=None):
+    def forward(self, x, start_pos, inv_freqs, mask=None):
         # KV cache!!!
         # Given |----cache_len----|----T----|; our model generates the logits for the next token
         # start_pos = cache_len
@@ -136,6 +129,10 @@ class GroupedQueryAttention(nn.Module):
         q = self.query(x).view(B, T, self.config.n_heads, self.head_size).transpose(1, 2) # (B, nh, T, head_size)
         k = self.key(x).view(B, T, self.config.kv_heads, self.head_size).transpose(1, 2) # (B, nkvh, cache_len + T, head_size)
         v = self.value(x).view(B, T, self.config.kv_heads, self.head_size).transpose(1, 2) # (B, nkvh, cache_len + T, head_size)
+        
+        # RoPE before caching!!!!!
+        q = apply_rope(q, inv_freqs)
+        k = apply_rope(k, inv_freqs)
 
         # Update the keys and values with the cache (now containing the keys and values from all previous tokens)
         if self.cache is not None:
@@ -144,9 +141,6 @@ class GroupedQueryAttention(nn.Module):
         # Grouped query attention
         k = k.repeat_interleave(self.config.n_heads // self.config.kv_heads, dim=1) # (B, nh, cache_len + T, head_size)
         v = v.repeat_interleave(self.config.n_heads // self.config.kv_heads, dim=1) # (B, nh, cache_len + T, head_size)
-
-        q = apply_rope(q, self.inv_freqs, start_pos)
-        k = apply_rope(k, self.inv_freqs, start_pos)
 
         if self.config.flash_attention:
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
@@ -181,8 +175,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.rmsn_mlp = RMSNorm(config.n_embd)
     
-    def forward(self, x, start_pos, mask=None):
-        x = x + self.attn(self.rmsn_attn(x), start_pos, mask)
+    def forward(self, x, start_pos, inv_freqs, mask=None):
+        x = x + self.attn(self.rmsn_attn(x), start_pos, inv_freqs, mask)
         x = x + self.mlp(self.rmsn_mlp(x))
         return x
 
@@ -201,27 +195,17 @@ class PiLlama(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
         self.tokenizer = tokenizer
 
-    # Deprecated
-    def forward(self, idx, targets=None):
-        B, T = idx.size()
-        x = self.transformer.wte(idx)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.rmsn(x)
-        logits = self.lm_head(x) # (B, T, n_embd)
-        loss = None
-        if targets is not None: 
-            loss = F.cross_entropy(logits.view(B * T, -1), targets.view(-1))
-        return logits, loss if loss is not None else logits
-    
-    def forward_loss(self, idx, targets):
+        self.inv_freqs = compute_inv_freqs(config.n_embd // config.n_heads, config.block_size, base=config.rope_base, device=self.lm_head.weight.device)
+
+    def forward(self, idx, targets):
         # For use during training
         B, T = idx.size()
         mask = torch.full((T, T), float('-inf'), device=idx.device)
         mask.triu_(diagonal=1)
+        inv_freqs = self.inv_freqs[:T]
         x = self.transformer.wte(idx)
         for block in self.transformer.h:
-            x = block(x, -1, mask) # -1 disable the cache
+            x = block(x, -1, inv_freqs, mask) # -1 disable the cache
         x = self.transformer.rmsn(x)
         logits = self.lm_head(x) # (B, T, n_embd)
         loss = F.cross_entropy(logits.view(B * T, -1), targets.view(-1))
@@ -236,14 +220,15 @@ class PiLlama(nn.Module):
         mask.triu_(diagonal=1)
         # Since we are using KVCache, we need to pad the mask with zeros
         mask = torch.cat([torch.zeros((T, start_pos), device=idx.device), mask], dim=-1) # (T, T + start_pos)
+        inv_freqs = self.inv_freqs[start_pos:start_pos + T]
         x = self.transformer.wte(idx)
         for block in self.transformer.h:
-            x = block(x, start_pos, mask)
+            x = block(x, start_pos, inv_freqs, mask)
         x = self.transformer.rmsn(x)
         logits = self.lm_head(x)
         return logits
     
-    def configure_optimizer(self, lr=9e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True, device_type='cuda'):
+    def configure_optimizer(self, lr=9e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True, device_type='cuda', master_process=False):
         params_dict = {np: p for np, p in self.named_parameters()}
         params_dict = {np: p for np, p in params_dict.items() if p.requires_grad}
         decay_params = [p for np, p in params_dict.items() if p.dim() >= 2]
@@ -303,8 +288,6 @@ class PiLlama(nn.Module):
             # Update tokens tensor with the newly generated token only if the tokens in the current position are not padding tokens
             next_tokens = torch.where(input_mask[:, cur_pos], tokens_tensor[:, cur_pos], next_tokens)
             tokens_tensor[:, cur_pos] = next_tokens
-            # print("Next: ")
-            # print(next_tokens)
             prev_pos = cur_pos
             # Stop generate when encounters an EOS token
             if eos_reached.all():
@@ -336,7 +319,7 @@ class PiLlama(nn.Module):
         return decoded
     
     @staticmethod
-    def load_checkpoint(checkpoint_path, tokenizer_path='pi_tokenizer.model', device='cpu'):
+    def load_checkpoint(checkpoint_path, tokenizer_path='pi_tokenizer.model', device=None):
         assert os.path.isfile(checkpoint_path), f"Checkpoint file not found: {checkpoint_path}"
         checkpoint = torch.load(checkpoint_path, map_location=device)
         tokenizer = Tokenizer(tokenizer_path)
@@ -373,173 +356,156 @@ class CosineLRScheduler:
         lr_decay_ratio = (it - self.warmup_step) / (self.max_step - self.warmup_step)
         return self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + math.cos(math.pi * lr_decay_ratio))
 
-# https://pytorch.org/docs/stable/elastic/run.html
-# torchrun --standalone --nproc_per_node=2 pillama.py
-ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run?
-if ddp: 
-    assert torch.cuda.is_available(), "CUDA required!"
-    init_process_group('nccl') # Backend to use (nccl for distributed GPUs training)
-    ddp_rank = int(os.environ['RANK']) # Rank of the current processor (on all nodes) (1 node <-> 1 device)
-    ddp_local_rank = int(os.environ['LOCAL_RANK']) # Rank of the current processor on the current node 
-    ddp_world_size = int(os.environ['WORLD_SIZE']) # Number of GPUs
-    device = f'cuda:{ddp_local_rank}' # 1 machine -> local_rank == rank
-    torch.cuda.set_device(device)
-    master_process = (ddp_rank == 0)
-else:
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    device = "cpu" 
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = "mps"
-    print("Device:", device)
+def main():
+    # https://pytorch.org/docs/stable/elastic/run.html
+    # torchrun --standalone --nproc_per_node=2 pillama.py
+    ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run?
+    if ddp: 
+        assert torch.cuda.is_available(), "CUDA required!"
+        init_process_group('nccl') # Backend to use (nccl for distributed GPUs training)
+        ddp_rank = int(os.environ['RANK']) # Rank of the current processor (on all nodes) (1 node <-> 1 device)
+        ddp_local_rank = int(os.environ['LOCAL_RANK']) # Rank of the current processor on the current node 
+        ddp_world_size = int(os.environ['WORLD_SIZE']) # Number of GPUs
+        device = f'cuda:{ddp_local_rank}' # 1 machine -> local_rank == rank
+        torch.cuda.set_device(device)
+        master_process = (ddp_rank == 0)
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        device = "cpu" 
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = "mps"
+        print("Device:", device)
 
-# B, T = 32, 2048
-# total_batch_size = 262144
-# grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-# val_size = 4541735 # Magic number
-# val_accum_steps = val_size // (B * T * ddp_world_size)
-# max_step = 6164 # Approx. 4 epochs
-# warmup_step = 50
+    # Training hyperparameters
+    B, T = 32, 2048
+    total_batch_size = 262144
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    val_size = 4541735 # Magic number
+    val_accum_steps = val_size // (B * T * ddp_world_size)
+    max_step = 6164 # Approx. 4 epochs
+    warmup_step = 50
 
-B, T = 4, 1024
-total_batch_size = 65536
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-val_size = 4541735 # Magic number
-val_accum_steps = val_size // (B * T * ddp_world_size)
-max_step = 6164 # Approx. 4 epochs
-warmup_step = 50
+    device_type = 'cuda' if device.startswith('cuda') else 'cpu'
 
-device_type = 'cuda' if device.startswith('cuda') else 'cpu'
+    # Using TF32 (if available) for faster matrix multiplication 
+    torch.set_float32_matmul_precision('high')
 
-# Using TF32 (if available) for faster matrix multiplication 
-torch.set_float32_matmul_precision('high')
+    # Mixed precision training with cuda
+    use_amp = device_type == 'cuda'
+    if use_amp:
+        type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        type = torch.float32
+    scaler = torch.cuda.amp.GradScaler(enabled=(type == torch.float16))
 
-# Mixed precision training with cuda
-use_amp = device_type == 'cuda'
-if use_amp:
-    type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-else:
-    type = torch.float32
-scaler = torch.cuda.amp.GradScaler(enabled=(type == torch.float16))
-
-model_config = PiLlamaConfig()
-tokenizer = Tokenizer('pi_tokenizer.model')
-model = PiLlama(model_config, tokenizer)
-model.to(device)
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model
-num_params = sum(p.numel() for p in model.parameters())
-if master_process:
-    print(f"Number of parameters: {num_params}")
-
-optimizer = raw_model.configure_optimizer(device_type=device)
-scheduler = CosineLRScheduler(
-    max_lr = model_config.max_lr, 
-    min_lr = 0.1 * model_config.max_lr, 
-    warmup_step = warmup_step, 
-    max_step = max_step
-)
-
-train_loader = DataLoaderLite( 
-    batch_size = B, 
-    sequence_length = T, 
-    process_rank = ddp_rank, 
-    num_processes = ddp_world_size,
-    split = 'train'
-)
-val_loader = DataLoaderLite( 
-    batch_size = B, 
-    sequence_length = T, 
-    process_rank = ddp_rank, 
-    num_processes = ddp_world_size,
-    split = 'validation',
-)
-
-log_dir = 'logs'
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, 'log.txt')
-log_val_file = os.path.join(log_dir, 'log_val.txt')
-    
-for step in range(0):
-    t0 = time.time()
-    loss_accum = 0.0
-    # Save checkpoint and eval every 250 steps
-    if ((step != 0 and step % 250 == 0) or step == max_step - 1):
-        with torch.no_grad():
-            model.eval()
-            val_loader.advance(reset=True)
-            val_accum = 0.0
-            for _ in range(val_accum_steps):
-                Xb, Yb = val_loader.next_batch()
-                Xb, Yb = Xb.to(device), Yb.to(device)
-                with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
-                    loss = model.forward_loss(Xb, Yb)
-                loss /= val_accum_steps
-                val_accum += loss.detach()
-            if ddp:
-                dist.all_reduce(val_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            with open(log_val_file, 'a') as f:
-                f.write(f'Step {step}, val loss {val_accum.item():.6f}\n')
-            checkpoint_path = os.path.join(log_dir, f'pillama_{step}.pt')
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'step': step
-            }
-            torch.save(checkpoint, checkpoint_path)
-    model.train()
-    for micro_step in range(grad_accum_steps):
-        Xb, Yb = train_loader.next_batch()
-        Xb, Yb = Xb.to(device), Yb.to(device)
-        # Only sync gradients at the end of a step
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
-            loss = model.forward_loss(Xb, Yb)
-        loss /= grad_accum_steps # Gradients accumulation
-        loss_accum += loss.detach() # No need to compute gradients 
-        scaler.scale(loss).backward()
+    model_config = PiLlamaConfig()
+    tokenizer = Tokenizer('pi_tokenizer.model')
+    model = PiLlama(model_config, tokenizer)
+    model.to(device)
     if ddp:
-        # Sync the loss between different processes across all machine and all of them receive the same final result
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    lr = scheduler.get_lr(step) 
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    # Gradient clipping
-    scaler.unscale_(optimizer)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad()
-    if device_type == "cuda":
-        torch.cuda.synchronize()
-    t1 = time.time()
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
+    num_params = sum(p.numel() for p in model.parameters())
     if master_process:
-        with open(log_file, 'a') as f:
-            f.write(f'Step {step}, training loss {loss_accum.item():.6f}, norm {norm:.4f}\n')
-        dt = t1 - t0
-        tok_per_sec = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size / dt
-        print(f'Step: {step} | Loss: {loss_accum.item():.6f} | LR: {lr:.4e} | Time: {1000 * dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
+        print(f"Number of parameters: {num_params}")
 
-model = PiLlama.load_checkpoint('logs/pillama_6163.pt')
+    optimizer = raw_model.configure_optimizer(device_type=device, master_process=master_process)
+    scheduler = CosineLRScheduler(
+        max_lr = model_config.max_lr, 
+        min_lr = 0.1 * model_config.max_lr, 
+        warmup_step = warmup_step, 
+        max_step = max_step
+    )
 
-prompts = [
-    "Once upon a time",
-]
-rng = torch.Generator(device=device)
-rng.manual_seed(0)
-t0 = time.time()
-generated = model.text_generation(prompts, max_gen_len=128, top_p=0.9, temperature=1., generator=rng)
-t1 = time.time()
-for text in generated:
-    print(text) 
-    print(f"Time: {t1 - t0:.2f}s")
-    print(f"Tokens per second: {len(text) / (t1 - t0):.2f}")
-if ddp:
-    destroy_process_group()
+    train_loader = DataLoaderLite( 
+        batch_size = B, 
+        sequence_length = T, 
+        process_rank = ddp_rank, 
+        num_processes = ddp_world_size,
+        split = 'train'
+    )
+    val_loader = DataLoaderLite( 
+        batch_size = B, 
+        sequence_length = T, 
+        process_rank = ddp_rank, 
+        num_processes = ddp_world_size,
+        split = 'validation',
+    )
+
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'log.txt')
+    log_val_file = os.path.join(log_dir, 'log_val.txt')
+
+    for step in range(max_step):
+        t0 = time.time()
+        loss_accum = 0.0
+        # Save checkpoint and eval every 250 steps
+        if ((step != 0 and step % 250 == 0) or step == max_step - 1):
+            with torch.no_grad():
+                model.eval()
+                val_loader.advance(reset=True)
+                val_accum = 0.0
+                for _ in range(val_accum_steps):
+                    Xb, Yb = val_loader.next_batch()
+                    Xb, Yb = Xb.to(device), Yb.to(device)
+                    with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
+                        loss = model(Xb, Yb)
+                    loss /= val_accum_steps
+                    val_accum += loss.detach()
+                if ddp:
+                    dist.all_reduce(val_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                with open(log_val_file, 'a') as f:
+                    f.write(f'Step {step}, val loss {val_accum.item():.6f}\n')
+                checkpoint_path = os.path.join(log_dir, f'pillama_{step}.pt')
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'step': step
+                }
+                torch.save(checkpoint, checkpoint_path)
+        model.train()
+        for micro_step in range(grad_accum_steps):
+            Xb, Yb = train_loader.next_batch()
+            Xb, Yb = Xb.to(device), Yb.to(device)
+            # Only sync gradients at the end of a step
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            with torch.autocast(device_type=device_type, dtype=type, enabled=use_amp):
+                loss = model(Xb, Yb)
+            loss /= grad_accum_steps # Gradients accumulation
+            loss_accum += loss.detach() # No need to compute gradients 
+            scaler.scale(loss).backward()
+        if ddp:
+            # Sync the loss between different processes across all machine and all of them receive the same final result
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        lr = scheduler.get_lr(step) 
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        # Gradient clipping
+        scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.time()
+        if master_process:
+            with open(log_file, 'a') as f:
+                f.write(f'Step {step}, training loss {loss_accum.item():.6f}, norm {norm:.4f}\n')
+            dt = t1 - t0
+            tok_per_sec = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size / dt
+            print(f'Step: {step} | Loss: {loss_accum.item():.6f} | LR: {lr:.4e} | Time: {1000 * dt:.2f}ms | Tok/sec: {tok_per_sec:.2f}')
+
+    if ddp:
+        destroy_process_group()
+
+if __name__ == '__main__':
+    main()
