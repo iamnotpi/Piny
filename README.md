@@ -20,7 +20,7 @@ The model hyperparameters are listed in the table below.
 | **Number of Layers**          | 4          |
 | **RoPE Base**                 | 10,000     |
 ## Training details
-Piny was trained for approximately 6 epochs using the AdamW optimizer. The optimizer was configured with \(\beta_1 = 0.9\), \(\beta_2 = 0.95\), and a weight decay of 0.1. The initial learning rate was set to \(9 \times 10^{-4}\).
+Piny was trained for approximately 6 epochs using the AdamW optimizer. The optimizer was configured with \($\beta_1$ = 0.9\), \($\beta_2$ = 0.95\), and a weight decay of 0.1. The initial learning rate was set to 9e-4.
 
 Training began with a linear warm-up phase for the first 50 steps, gradually increasing the learning rate to its peak. After the warm-up, a cosine learning rate scheduler was employed to decay the learning rate, reducing it to 10% of the initial value over 6,000 steps. Once this threshold was reached, the model continued training at this reduced learning rate until the completion of the training process.
 ## Result
