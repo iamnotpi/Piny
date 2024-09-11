@@ -1,4 +1,5 @@
 # Piny
+![Piny](https://github.com/iamnotpi/Piny/blob/main/piny.png)
 ## Introduction
 Piny is a small language model that is capable of telling stories.
 ## Model architecture 
